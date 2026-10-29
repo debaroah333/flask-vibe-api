@@ -1,0 +1,1 @@
+vscode://Postman.postman-for-vscode?code=b3080d53089329ce187cc2a6f085b3cdae89f219c687147dea4219f64822500b
