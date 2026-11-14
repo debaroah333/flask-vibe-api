@@ -43,6 +43,64 @@ def compute_period_key(d: date) -> str:
 
 
 # ==========================================
+# 月度現金流彙總路由 (Monthly Summary)
+# ==========================================
+
+
+@api_bp.get("/summary")
+def get_monthly_summary():
+    raw_month = request.args.get("month")
+    if not raw_month or not isinstance(raw_month, str) or not raw_month.strip():
+        return json_response(400, "缺少必填查詢參數：month（月份，格式 YYYY-MM）", None)
+
+    month_str = raw_month.strip()
+    import re
+
+    match = re.match(r"^(\d{4})-(0[1-9]|1[0-2])$", month_str)
+    if not match:
+        return json_response(400, "查詢參數 month 格式不符，請使用 YYYY-MM 格式（如 2026-11）", None)
+
+    year = int(match.group(1))
+    month = int(match.group(2))
+
+    start_date = date(year, month, 1)
+    if month in {1, 3, 5, 7, 8, 10, 12}:
+        last_day = 31
+    elif month in {4, 6, 9, 11}:
+        last_day = 30
+    else:
+        last_day = 29 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 28
+    end_date = date(year, month, last_day)
+
+    try:
+        # 入帳合計：received_on 落在該月的入帳，金額乘 fx_rate_to_twd 後加總
+        incomes = Income.query.filter(
+            Income.received_on >= start_date, Income.received_on <= end_date
+        ).all()
+        income_twd = sum(
+            (inc.amount * inc.fx_rate_to_twd for inc in incomes), Decimal("0")
+        )
+
+        # 花費合計：spent_on 落在該月的花費，金額乘 fx_rate_to_twd 後加總
+        expenses = Expense.query.filter(
+            Expense.spent_on >= start_date, Expense.spent_on <= end_date
+        ).all()
+        expense_twd = sum(
+            (exp.amount * exp.fx_rate_to_twd for exp in expenses), Decimal("0")
+        )
+
+        data = {
+            "month": month_str,
+            "income_twd": float(income_twd),
+            "expense_twd": float(expense_twd),
+        }
+        return json_response(200, "成功取得月份現金流彙總", data)
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+# ==========================================
 # 帳戶相關路由 (Accounts)
 # ==========================================
 
