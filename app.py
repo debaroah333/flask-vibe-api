@@ -37,6 +37,48 @@ def create_app():
 
     db.init_app(app)
 
+    import re
+    from flask import make_response, request
+
+    def is_allowed_origin(origin: str) -> bool:
+        if not origin:
+            return False
+        if re.match(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$", origin):
+            return True
+        web_origin = os.getenv("WEB_ORIGIN")
+        if web_origin and origin == web_origin.strip():
+            return True
+        return False
+
+    @app.before_request
+    def handle_cors_preflight():
+        if request.method == "OPTIONS":
+            origin = request.headers.get("Origin")
+            response = make_response("", 204)
+            if origin and is_allowed_origin(origin):
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Methods"] = "GET, POST, PATCH, PUT, DELETE, OPTIONS"
+                req_headers = request.headers.get("Access-Control-Request-Headers")
+                if req_headers:
+                    response.headers["Access-Control-Allow-Headers"] = req_headers
+                else:
+                    response.headers["Access-Control-Allow-Headers"] = "*"
+                response.headers["Access-Control-Max-Age"] = "86400"
+                response.headers["Access-Control-Allow-Private-Network"] = "true"
+            response.headers["Vary"] = "Origin"
+            response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+            return response
+
+    @app.after_request
+    def add_cors_headers(response):
+        origin = request.headers.get("Origin")
+        if origin and is_allowed_origin(origin):
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Private-Network"] = "true"
+        response.headers["Vary"] = "Origin"
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        return response
+
     from routes import api_bp
     app.register_blueprint(api_bp)
 

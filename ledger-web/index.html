@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>個人記帳本</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app-container">
+
+    <!-- 全域提示訊息 (Toast) -->
+    <div id="toast" class="toast hidden" role="alert" aria-live="polite"></div>
+
+    <!-- ========================================== -->
+    <!-- 1. 連線設定頁面 (Connection View) -->
+    <!-- ========================================== -->
+    <section id="view-connection" class="view">
+      <div class="connection-card card">
+        <div class="brand-header">
+          <div class="brand-icon">
+            <svg viewBox="0 0 24 24" width="32" height="32" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="4" width="18" height="16" rx="2"></rect>
+              <line x1="7" y1="8" x2="17" y2="8"></line>
+              <line x1="7" y1="12" x2="17" y2="12"></line>
+              <line x1="7" y1="16" x2="13" y2="16"></line>
+            </svg>
+          </div>
+          <h1>個人記帳本</h1>
+          <p class="sub-text">請輸入後端 API 伺服器網址進行連線</p>
+        </div>
+
+        <form id="form-connection" class="form-stack">
+          <div class="field-group">
+            <label for="input-api-url">後端服務網址</label>
+            <input 
+              type="url" 
+              id="input-api-url" 
+              name="apiUrl" 
+              placeholder="http://127.0.0.1:5000" 
+              value="http://127.0.0.1:5000"
+              required
+              autocomplete="off"
+            >
+            <small class="field-hint">僅支援 http:// 或 https:// 協定</small>
+          </div>
+
+          <div id="connection-error" class="error-banner hidden"></div>
+
+          <button type="submit" id="btn-connect" class="btn btn-primary btn-block">
+            連線並進入記帳本
+          </button>
+        </form>
+      </div>
+    </section>
+
+    <!-- ========================================== -->
+    <!-- 2. 主應用程式頁面 (Main View) -->
+    <!-- ========================================== -->
+    <div id="view-main" class="view hidden">
+      <!-- 頂部導航列 -->
+      <header class="app-header">
+        <div class="header-left">
+          <span class="status-indicator online" title="連線正常"></span>
+          <h2 id="header-title" class="header-title">首頁</h2>
+        </div>
+        <div class="header-right">
+          <button type="button" id="btn-clear-conn" class="btn-text" title="移除連線資訊並返回連線頁">
+            清除連線
+          </button>
+        </div>
+      </header>
+
+      <!-- 主要內容滾動區 -->
+      <main class="main-content">
+
+        <!-- ---------------------------------------- -->
+        <!-- 分頁 1：首頁 (Home) -->
+        <!-- ---------------------------------------- -->
+        <section id="page-home" class="page">
+          <!-- 本月收支總覽卡 -->
+          <div class="card summary-card">
+            <div class="summary-header">
+              <span class="card-title">本月收支彙總</span>
+              <span id="summary-month-label" class="badge badge-neutral">載入中...</span>
+            </div>
+            <div class="summary-grid">
+              <div class="summary-item income">
+                <span class="summary-label">總入帳</span>
+                <span id="summary-income" class="summary-amount amount-num">0.00</span>
+              </div>
+              <div class="summary-item expense">
+                <span class="summary-label">總花費</span>
+                <span id="summary-expense" class="summary-amount amount-num">0.00</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- 我的帳戶卡片 -->
+          <div class="section-block">
+            <div class="section-header">
+              <h3>我的帳戶</h3>
+              <button type="button" id="btn-refresh-accounts" class="btn-icon" title="重新整理">
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.19"></path>
+                </svg>
+              </button>
+            </div>
+
+            <div id="accounts-list" class="accounts-list">
+              <!-- 帳戶項目由 JS 動態生成 -->
+            </div>
+
+            <!-- 尚無帳戶時的快速建立卡片 -->
+            <div id="card-create-account" class="card empty-state-card hidden">
+              <p class="empty-text">目前尚無帳戶，請先建立第一個現金帳戶：</p>
+              <form id="form-create-account" class="form-inline">
+                <input 
+                  type="text" 
+                  id="input-acc-name" 
+                  placeholder="帳戶名稱 (例如：日常現金包)" 
+                  value="現金錢包" 
+                  maxlength="50"
+                  required
+                >
+                <button type="submit" class="btn btn-primary">建立現金帳戶</button>
+              </form>
+            </div>
+          </div>
+        </section>
+
+        <!-- ---------------------------------------- -->
+        <!-- 分頁 2：記帳 (Bookkeeping) -->
+        <!-- ---------------------------------------- -->
+        <section id="page-bookkeeping" class="page hidden">
+          <!-- 記帳種類切換 Tab (花費 / 入帳) -->
+          <div class="segmented-control">
+            <button type="button" id="tab-type-expense" class="segment-btn active" data-type="expense">花費</button>
+            <button type="button" id="tab-type-income" class="segment-btn" data-type="income">入帳</button>
+          </div>
+
+          <!-- 分類為空時的快速新增分類區塊 -->
+          <div id="quick-create-category-card" class="card highlight-card hidden">
+            <p id="category-empty-hint" class="hint-text">目前尚無分類，請先新增一個分類：</p>
+            <form id="form-quick-category" class="form-inline">
+              <input 
+                type="text" 
+                id="input-quick-cat-name" 
+                placeholder="分類名稱 (例如：餐飲飲食)" 
+                maxlength="50"
+                required
+              >
+              <button type="submit" class="btn btn-primary">新增分類</button>
+            </form>
+          </div>
+
+          <!-- 記帳表單卡片 -->
+          <div class="card form-card">
+            <form id="form-record">
+              <!-- 日期 -->
+              <div class="field-group">
+                <label for="input-record-date" id="label-record-date">消費日期</label>
+                <input type="date" id="input-record-date" required>
+              </div>
+
+              <!-- 金額 -->
+              <div class="field-group">
+                <label for="input-record-amount">金額 (TWD)</label>
+                <input 
+                  type="number" 
+                  id="input-record-amount" 
+                  step="0.01" 
+                  min="0.01" 
+                  placeholder="0.00" 
+                  required
+                  class="amount-input"
+                >
+              </div>
+
+              <!-- 分類下拉 -->
+              <div class="field-group">
+                <div class="label-row">
+                  <label for="select-record-category">分類</label>
+                  <button type="button" id="btn-toggle-add-cat" class="btn-link">+ 新分類</button>
+                </div>
+                <select id="select-record-category" required>
+                  <option value="">載入中...</option>
+                </select>
+              </div>
+
+              <!-- 折疊式新增分類欄 -->
+              <div id="inline-add-cat-wrap" class="inline-add-wrap hidden">
+                <input type="text" id="input-inline-cat-name" placeholder="輸入新分類名稱" maxlength="50">
+                <button type="button" id="btn-inline-cat-save" class="btn btn-secondary">確定新增</button>
+              </div>
+
+              <!-- 帳戶下拉 -->
+              <div class="field-group">
+                <label for="select-record-account" id="label-record-account">扣款帳戶</label>
+                <select id="select-record-account" required>
+                  <option value="">載入中...</option>
+                </select>
+              </div>
+
+              <!-- 花費專屬：商家 (與備註擇一必填) -->
+              <div id="group-merchant" class="field-group">
+                <label for="input-record-merchant">商家名稱</label>
+                <input type="text" id="input-record-merchant" placeholder="例如：便利商店、便當店" maxlength="100">
+              </div>
+
+              <!-- 入帳專屬：來源 (與備註擇一必填) -->
+              <div id="group-source" class="field-group hidden">
+                <label for="input-record-source">來源描述</label>
+                <input type="text" id="input-record-source" placeholder="例如：公司薪資、活存利息" maxlength="100">
+              </div>
+
+              <!-- 備註 -->
+              <div class="field-group">
+                <label for="input-record-note">備註說明</label>
+                <input type="text" id="input-record-note" placeholder="例如：午餐、專案獎金">
+                <small class="field-hint" id="hint-desc-rule">商家與備註至少需填寫一項</small>
+              </div>
+
+              <button type="submit" id="btn-submit-record" class="btn btn-primary btn-block">
+                記錄花費
+              </button>
+            </form>
+          </div>
+
+          <!-- 本月明細清單 -->
+          <div class="section-block">
+            <div class="section-header">
+              <h3 id="record-list-title">本月明細</h3>
+              <span id="record-count-label" class="badge badge-neutral">0 筆</span>
+            </div>
+            <div id="records-container" class="records-container">
+              <!-- 動態生成明細列 -->
+            </div>
+          </div>
+        </section>
+
+        <!-- ---------------------------------------- -->
+        <!-- 分頁 3：投資 (Investment) -->
+        <!-- ---------------------------------------- -->
+        <section id="page-investment" class="page hidden">
+          <div class="investment-action-bar">
+            <div>
+              <h3>台股標的持倉</h3>
+              <p class="sub-text">僅列出市場為 tw_stock 之投資標的</p>
+            </div>
+            <button type="button" id="btn-fetch-quotes" class="btn btn-secondary">
+              抓取最新報價
+            </button>
+          </div>
+
+          <!-- 報價更新狀態訊息 -->
+          <div id="quote-fetch-msg" class="info-banner hidden"></div>
+
+          <!-- 標的清單 -->
+          <div id="instruments-list" class="instruments-list">
+            <!-- 標的卡片由 JS 動態生成 -->
+          </div>
+
+          <!-- 尚無標的時的快速新增卡片 -->
+          <div id="card-create-instrument" class="card empty-state-card hidden">
+            <p class="empty-text">目前尚無台股標的，可新增一檔標的：</p>
+            <form id="form-create-instrument" class="form-stack">
+              <div class="field-group">
+                <label for="input-inst-symbol">標的代號</label>
+                <input type="text" id="input-inst-symbol" placeholder="例如：2330" maxlength="20" required>
+              </div>
+              <div class="field-group">
+                <label for="input-inst-name">標的名稱</label>
+                <input type="text" id="input-inst-name" placeholder="例如：台積電" maxlength="100" required>
+              </div>
+              <button type="submit" class="btn btn-primary btn-block">新增台股標的</button>
+            </form>
+          </div>
+        </section>
+
+        <!-- ---------------------------------------- -->
+        <!-- 分頁 4：發票 (Invoices) -->
+        <!-- ---------------------------------------- -->
+        <section id="page-invoices" class="page hidden">
+          <div class="section-header">
+            <div>
+              <h3>統一發票清單</h3>
+              <p class="sub-text">檢視已登錄之發票與中獎狀態</p>
+            </div>
+            <button type="button" id="btn-refresh-invoices" class="btn-icon" title="重新整理">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.19"></path>
+              </svg>
+            </button>
+          </div>
+
+          <div id="invoices-list" class="invoices-list">
+            <!-- 發票卡片由 JS 動態生成 -->
+          </div>
+        </section>
+
+      </main>
+
+      <!-- 底部導覽列 (Bottom Navigation) -->
+      <nav id="bottom-nav" class="bottom-nav" aria-label="主要導覽">
+        <button type="button" class="nav-item active" data-target="home">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path>
+            <polyline points="9 22 9 12 15 12 15 22"></polyline>
+          </svg>
+          <span class="nav-label">首頁</span>
+        </button>
+
+        <button type="button" class="nav-item" data-target="bookkeeping">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M12 20h9"></path>
+            <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+          </svg>
+          <span class="nav-label">記帳</span>
+        </button>
+
+        <button type="button" class="nav-item" data-target="investment">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="20" x2="18" y2="10"></line>
+            <line x1="12" y1="20" x2="12" y2="4"></line>
+            <line x1="6" y1="20" x2="6" y2="14"></line>
+          </svg>
+          <span class="nav-label">投資</span>
+        </button>
+
+        <button type="button" class="nav-item" data-target="invoices">
+          <svg class="nav-icon" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="2" y="3" width="20" height="14" rx="2"></rect>
+            <line x1="8" y1="21" x2="16" y2="21"></line>
+            <line x1="12" y1="17" x2="12" y2="21"></line>
+          </svg>
+          <span class="nav-label">發票</span>
+        </button>
+      </nav>
+    </div>
+
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
