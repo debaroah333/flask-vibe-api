@@ -7,11 +7,16 @@ from sqlalchemy.exc import IntegrityError
 from extensions import db
 from models import (
     Account,
+    DrawPeriod,
+    DrawPrize,
     Expense,
     ExpenseCategory,
     Income,
     IncomeCategory,
+    Instrument,
     Invoice,
+    InvoiceItem,
+    Trade,
     Transfer,
 )
 
@@ -29,6 +34,12 @@ def json_response(code: int, message: str, data=None):
         ),
         code,
     )
+
+
+def compute_period_key(d: date) -> str:
+    """依開立日推導發票期別：1-2月為 YYYY-01，3-4月為 YYYY-03，...，11-12月為 YYYY-11"""
+    odd_month = ((d.month - 1) // 2) * 2 + 1
+    return f"{d.year:04d}-{odd_month:02d}"
 
 
 # ==========================================
@@ -239,6 +250,9 @@ def get_account_balance(account_id):
         outgoing = Transfer.query.filter_by(from_account_id=account.id).all()
         account_incomes = Income.query.filter_by(account_id=account.id).all()
         account_expenses = Expense.query.filter_by(account_id=account.id).all()
+        account_trades = Trade.query.filter(
+            Trade.account_id == account.id, Trade.voided_at.is_(None)
+        ).all()
 
         opening_balance = (
             account.opening_balance
@@ -249,12 +263,37 @@ def get_account_balance(account_id):
         out_transfer_amount = sum((t.amount for t in outgoing), Decimal("0"))
         income_amount = sum((inc.amount for inc in account_incomes), Decimal("0"))
         expense_amount = sum((exp.amount for exp in account_expenses), Decimal("0"))
+
+        trade_amount = Decimal("0")
+        trade_twd = Decimal("0")
+
+        for tr in account_trades:
+            qty = tr.quantity if tr.quantity is not None else Decimal("0")
+            prc = tr.price if tr.price is not None else Decimal("0")
+            fee = tr.fee if tr.fee is not None else Decimal("0")
+            tax = tr.tax if tr.tax is not None else Decimal("0")
+            cash = tr.cash_amount if tr.cash_amount is not None else Decimal("0")
+            fx = tr.fx_rate_to_twd if tr.fx_rate_to_twd is not None else Decimal("1.0")
+
+            if tr.trade_type == "buy":
+                cost = (qty * prc) + fee + tax
+                trade_amount -= cost
+                trade_twd -= cost * fx
+            elif tr.trade_type == "sell":
+                proceeds = (qty * prc) - fee - tax
+                trade_amount += proceeds
+                trade_twd += proceeds * fx
+            elif tr.trade_type in {"cash_dividend", "capital_reduction"}:
+                trade_amount += cash
+                trade_twd += cash * fx
+
         original_balance = (
             opening_balance
             + in_transfer_amount
             - out_transfer_amount
             + income_amount
             - expense_amount
+            + trade_amount
         )
 
         in_transfer_twd = sum(
@@ -277,6 +316,7 @@ def get_account_balance(account_id):
                 - out_transfer_twd
                 + income_twd
                 - expense_twd
+                + trade_twd
             )
         else:
             twd_balance = (
@@ -284,6 +324,7 @@ def get_account_balance(account_id):
                 - out_transfer_twd
                 + income_twd
                 - expense_twd
+                + trade_twd
             )
 
         data = {
@@ -1409,4 +1450,1188 @@ def update_expense(expense_id):
     except Exception:
         db.session.rollback()
         return json_response(500, "資料庫暫時連不上", None)
+
+
+# ==========================================
+# 統一發票與品項相關路由 (Invoices & Items)
+# ==========================================
+
+
+@api_bp.post("/invoices")
+def create_invoice():
+    if not request.is_json:
+        return json_response(400, "請使用 JSON 格式傳送請求", None)
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return json_response(400, "請求內容必須為 JSON 物件", None)
+
+    # 必填：number（發票號碼：兩碼大寫英文加八碼數字）
+    raw_number = payload.get("number")
+    if not raw_number or not isinstance(raw_number, str):
+        return json_response(400, "缺少必填欄位或格式錯誤：number（發票號碼）", None)
+    number = raw_number.strip().upper()
+    import re
+
+    if not re.match(r"^[A-Z]{2}[0-9]{8}$", number):
+        return json_response(
+            400, "發票號碼格式不符，必須為 2 碼大寫英文字母加上 8 碼數字", None
+        )
+
+    # 必填：issued_on（開立日）
+    raw_issued = payload.get("issued_on")
+    if not raw_issued:
+        return json_response(400, "缺少必填欄位：issued_on（開立日期）", None)
+    try:
+        issued_on = date.fromisoformat(str(raw_issued).strip())
+    except (ValueError, TypeError):
+        return json_response(400, "開立日期格式錯誤，請使用 YYYY-MM-DD 格式", None)
+
+    # 必填：amount（金額 > 0）
+    raw_amount = payload.get("amount")
+    if raw_amount is None:
+        return json_response(400, "缺少必填欄位：amount（發票金額）", None)
+    try:
+        amount = Decimal(str(raw_amount).strip())
+    except (InvalidOperation, ValueError, TypeError):
+        return json_response(400, "發票金額格式不正確，必須為數值", None)
+    if amount <= 0:
+        return json_response(400, "發票金額必須大於 0", None)
+
+    # 必填：kind（只允許 paper、electronic）
+    kind = payload.get("kind")
+    if not kind or not isinstance(kind, str) or kind.strip() not in {"paper", "electronic"}:
+        return json_response(400, "發票種類不合法，只允許 paper 或 electronic", None)
+    kind = kind.strip()
+
+    # 選填：currency（未送時用 TWD）
+    raw_currency = payload.get("currency")
+    if raw_currency is None or not str(raw_currency).strip():
+        currency = "TWD"
+    else:
+        currency = str(raw_currency).strip().upper()
+        if len(currency) != 3:
+            return json_response(400, "幣別代碼必須為 3 碼英文字母", None)
+
+    # 選填：fx_rate_to_twd（未送且幣別為 TWD 時用 1）
+    raw_fx = payload.get("fx_rate_to_twd")
+    if raw_fx is None or not str(raw_fx).strip():
+        if currency == "TWD":
+            fx_rate_to_twd = Decimal("1.000000")
+        else:
+            return json_response(400, "外幣發票必須填寫匯率 fx_rate_to_twd", None)
+    else:
+        try:
+            fx_rate_to_twd = Decimal(str(raw_fx).strip())
+        except (InvalidOperation, ValueError, TypeError):
+            return json_response(400, "台幣匯率格式不正確，必須為數值", None)
+        if fx_rate_to_twd <= 0:
+            return json_response(400, "台幣匯率必須大於 0", None)
+
+    # 選填：random_code（可空，有值時為四碼數字）
+    raw_random = payload.get("random_code")
+    random_code = None
+    if raw_random is not None and str(raw_random).strip():
+        random_code = str(raw_random).strip()
+        if not re.match(r"^[0-9]{4}$", random_code):
+            return json_response(400, "隨機碼格式錯誤，必須為 4 碼數字", None)
+
+    # 選填：seller_name, seller_ban
+    raw_seller_name = payload.get("seller_name")
+    seller_name = str(raw_seller_name).strip() if raw_seller_name else None
+
+    raw_seller_ban = payload.get("seller_ban")
+    seller_ban = str(raw_seller_ban).strip() if raw_seller_ban else None
+
+    # 重複號碼檢查
+    try:
+        existing = Invoice.query.filter_by(number=number).first()
+        if existing:
+            return json_response(400, "此發票號碼已存在，不可重複建立", None)
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+    invoice = Invoice(
+        number=number,
+        issued_on=issued_on,
+        amount=amount,
+        kind=kind,
+        currency=currency,
+        fx_rate_to_twd=fx_rate_to_twd,
+        random_code=random_code,
+        seller_name=seller_name,
+        seller_ban=seller_ban,
+        prize_status="unchecked",
+    )
+
+    try:
+        db.session.add(invoice)
+        db.session.commit()
+        return json_response(201, "發票建立成功", invoice.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "發票資料違反約束條件（例如號碼重複或格式錯誤）", None)
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.get("/invoices")
+def get_invoices():
+    try:
+        query = Invoice.query
+
+        # 篩選：period_key (格式例如 2026-01)
+        raw_period_key = request.args.get("period_key")
+        if raw_period_key is not None and raw_period_key.strip():
+            period_key = raw_period_key.strip()
+            # 依開立日計算期別過濾：YYYY-MM 到 YYYY-MM+1
+            import re
+
+            match = re.match(r"^(\d{4})-(01|03|05|07|09|11)$", period_key)
+            if not match:
+                return json_response(
+                    400,
+                    "期別格式錯誤，必須為 YYYY-01、YYYY-03、YYYY-05、YYYY-07、YYYY-09 或 YYYY-11",
+                    None,
+                )
+            year = int(match.group(1))
+            start_month = int(match.group(2))
+            start_date = date(year, start_month, 1)
+            end_month = start_month + 1
+            # 次月最後一日
+            if end_month in {1, 3, 5, 7, 8, 10, 12}:
+                last_day = 31
+            elif end_month in {4, 6, 9, 11}:
+                last_day = 30
+            else:
+                last_day = 29 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 28
+            end_date = date(year, end_month, last_day)
+
+            query = query.filter(
+                Invoice.issued_on >= start_date, Invoice.issued_on <= end_date
+            )
+
+        # 篩選：prize_status
+        raw_status = request.args.get("prize_status")
+        if raw_status is not None and raw_status.strip():
+            status = raw_status.strip()
+            if status not in {"unchecked", "lost", "won", "claimed", "void"}:
+                return json_response(
+                    400,
+                    "中獎狀態不合法，只允許 unchecked、lost、won、claimed、void",
+                    None,
+                )
+            query = query.filter(Invoice.prize_status == status)
+
+        invoices = query.order_by(Invoice.issued_on.asc(), Invoice.id.asc()).all()
+        return json_response(200, "成功取得發票清單", [inv.to_dict() for inv in invoices])
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.get("/invoices/<int:invoice_id>")
+def get_invoice(invoice_id):
+    try:
+        invoice = db.session.get(Invoice, invoice_id)
+        if not invoice:
+            return json_response(404, "找不到指定的發票", None)
+
+        data = invoice.to_dict()
+        # 帶上品項清單
+        data["items"] = [item.to_dict() for item in invoice.items]
+        # 帶上已掛上的花費 id 清單
+        expenses = Expense.query.filter_by(invoice_id=invoice.id).all()
+        data["expense_ids"] = [exp.id for exp in expenses]
+
+        return json_response(200, "成功取得發票資料", data)
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.patch("/invoices/<int:invoice_id>")
+def update_invoice(invoice_id):
+    try:
+        invoice = db.session.get(Invoice, invoice_id)
+        if not invoice:
+            return json_response(404, "找不到指定的發票", None)
+
+        if not request.is_json:
+            return json_response(400, "請使用 JSON 格式傳送請求", None)
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return json_response(400, "請求內容必須為 JSON 物件", None)
+
+        # 不可改號碼與主鍵，若有傳送直接忽略
+
+        import re
+
+        if "seller_name" in payload:
+            raw_sname = payload["seller_name"]
+            invoice.seller_name = str(raw_sname).strip() if raw_sname else None
+
+        if "seller_ban" in payload:
+            raw_sban = payload["seller_ban"]
+            invoice.seller_ban = str(raw_sban).strip() if raw_sban else None
+
+        if "random_code" in payload:
+            raw_random = payload["random_code"]
+            if raw_random is None or not str(raw_random).strip():
+                invoice.random_code = None
+            else:
+                rc = str(raw_random).strip()
+                if not re.match(r"^[0-9]{4}$", rc):
+                    return json_response(400, "隨機碼格式錯誤，必須為 4 碼數字", None)
+                invoice.random_code = rc
+
+        if "prize_status" in payload:
+            new_status = payload["prize_status"]
+            if new_status == "void":
+                invoice.prize_status = "void"
+            elif new_status is not None:
+                return json_response(
+                    400, "透過此端點修改中獎狀態僅允許改為 void（作廢）", None
+                )
+
+        invoice.updated_at = datetime.now(timezone.utc)
+        db.session.commit()
+        return json_response(200, "發票更新成功", invoice.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "更新資料違反約束條件", None)
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.post("/invoices/<int:invoice_id>/items")
+def create_invoice_item(invoice_id):
+    try:
+        invoice = db.session.get(Invoice, invoice_id)
+        if not invoice:
+            return json_response(404, "找不到指定的發票", None)
+
+        if not request.is_json:
+            return json_response(400, "請使用 JSON 格式傳送請求", None)
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return json_response(400, "請求內容必須為 JSON 物件", None)
+
+        # 必填：name
+        raw_name = payload.get("name")
+        if not raw_name or not isinstance(raw_name, str) or not raw_name.strip():
+            return json_response(400, "缺少必填欄位或欄位為空：name（品項名稱）", None)
+        name = raw_name.strip()
+
+        # 必填：quantity > 0
+        raw_qty = payload.get("quantity")
+        if raw_qty is None:
+            return json_response(400, "缺少必填欄位：quantity（數量）", None)
+        try:
+            quantity = Decimal(str(raw_qty).strip())
+        except (InvalidOperation, ValueError, TypeError):
+            return json_response(400, "數量格式不正確，必須為數值", None)
+        if quantity <= 0:
+            return json_response(400, "數量必須大於 0", None)
+
+        # 必填：unit_price > 0
+        raw_price = payload.get("unit_price")
+        if raw_price is None:
+            return json_response(400, "缺少必填欄位：unit_price（單價）", None)
+        try:
+            unit_price = Decimal(str(raw_price).strip())
+        except (InvalidOperation, ValueError, TypeError):
+            return json_response(400, "單價格式不正確，必須為數值", None)
+        if unit_price <= 0:
+            return json_response(400, "單價必須大於 0", None)
+
+        # 必填：line_amount > 0
+        raw_subtotal = payload.get("line_amount")
+        if raw_subtotal is None:
+            return json_response(400, "缺少必填欄位：line_amount（小計金額）", None)
+        try:
+            line_amount = Decimal(str(raw_subtotal).strip())
+        except (InvalidOperation, ValueError, TypeError):
+            return json_response(400, "小計金額格式不正確，必須為數值", None)
+        if line_amount <= 0:
+            return json_response(400, "小計金額必須大於 0", None)
+
+        item = InvoiceItem(
+            invoice_id=invoice.id,
+            name=name,
+            quantity=quantity,
+            unit_price=unit_price,
+            line_amount=line_amount,
+        )
+
+        db.session.add(item)
+        db.session.commit()
+        return json_response(201, "發票品項新增成功", item.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "品項資料違反約束條件", None)
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.get("/invoices/<int:invoice_id>/items")
+def get_invoice_items(invoice_id):
+    try:
+        invoice = db.session.get(Invoice, invoice_id)
+        if not invoice:
+            return json_response(404, "找不到指定的發票", None)
+
+        items = InvoiceItem.query.filter_by(invoice_id=invoice.id).order_by(InvoiceItem.id.asc()).all()
+        return json_response(200, "成功取得發票品項清單", [item.to_dict() for item in items])
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+# ==========================================
+# 開獎期與獎號相關路由 (Draw Periods & Prizes)
+# ==========================================
+
+
+@api_bp.post("/draw-periods")
+def create_draw_period():
+    if not request.is_json:
+        return json_response(400, "請使用 JSON 格式傳送請求", None)
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return json_response(400, "請求內容必須為 JSON 物件", None)
+
+    raw_key = payload.get("period_key")
+    if not raw_key or not isinstance(raw_key, str) or not raw_key.strip():
+        return json_response(400, "缺少必填欄位或欄位為空：period_key（期別）", None)
+    period_key = raw_key.strip()
+
+    import re
+
+    if not re.match(r"^\d{4}-(01|03|05|07|09|11)$", period_key):
+        return json_response(
+            400,
+            "期別格式不符，請使用 YYYY-01、YYYY-03、YYYY-05、YYYY-07、YYYY-09 或 YYYY-11 格式",
+            None,
+        )
+
+    try:
+        existing = DrawPeriod.query.filter_by(period_key=period_key).first()
+        if existing:
+            return json_response(400, "此開獎期別已存在，不可重複建立", None)
+
+        period = DrawPeriod(period_key=period_key)
+        db.session.add(period)
+        db.session.commit()
+        return json_response(201, "開獎期建立成功", period.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "開獎期資料違反約束條件（例如期別重複）", None)
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.post("/draw-periods/<int:period_id>/prizes")
+def create_draw_prize(period_id):
+    try:
+        period = db.session.get(DrawPeriod, period_id)
+        if not period:
+            return json_response(404, "找不到指定的開獎期", None)
+
+        if not request.is_json:
+            return json_response(400, "請使用 JSON 格式傳送請求", None)
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return json_response(400, "請求內容必須為 JSON 物件", None)
+
+        # 必填：tier
+        raw_tier = payload.get("tier")
+        allowed_tiers = {
+            "special",
+            "grand",
+            "first",
+            "second",
+            "third",
+            "fourth",
+            "fifth",
+            "sixth",
+            "extra_sixth",
+        }
+        if not raw_tier or raw_tier.strip() not in allowed_tiers:
+            return json_response(
+                400,
+                "獎項種類不合法，只允許 special、grand、first、second、third、fourth、fifth、sixth、extra_sixth",
+                None,
+            )
+        tier = raw_tier.strip()
+
+        # 必填：matching_number
+        raw_num = payload.get("matching_number")
+        if not raw_num or not isinstance(raw_num, str) or not raw_num.strip():
+            return json_response(400, "缺少必填欄位或欄位為空：matching_number（對獎號碼）", None)
+        matching_number = raw_num.strip()
+
+        import re
+
+        if tier in {"special", "grand", "first"}:
+            if not re.match(r"^[0-9]{8}$", matching_number):
+                return json_response(
+                    400, f"{tier} 獎項的對獎號碼必須是嚴格 8 碼數字", None
+                )
+        elif not re.match(r"^[0-9]+$", matching_number):
+            return json_response(400, "對獎號碼必須為純數字", None)
+
+        # 必填：amount >= 0
+        raw_amount = payload.get("amount")
+        if raw_amount is None:
+            return json_response(400, "缺少必填欄位：amount（獎金金額）", None)
+        try:
+            amount = Decimal(str(raw_amount).strip())
+        except (InvalidOperation, ValueError, TypeError):
+            return json_response(400, "獎金金額格式不正確，必須為數值", None)
+        if amount < 0:
+            return json_response(400, "獎金金額不可小於 0", None)
+
+        prize = DrawPrize(
+            draw_period_id=period.id,
+            tier=tier,
+            matching_number=matching_number,
+            amount=amount,
+        )
+
+        db.session.add(prize)
+        db.session.commit()
+        return json_response(201, "獎項新增成功", prize.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(
+            400, "同一期、同一獎項且同一中獎號碼不可重複建立", None
+        )
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.post("/draw-periods/<int:period_id>/check")
+def check_period_invoices(period_id):
+    try:
+        period = db.session.get(DrawPeriod, period_id)
+        if not period:
+            return json_response(404, "找不到指定的開獎期", None)
+
+        # 取得該開獎期底下的所有獎項
+        prizes = DrawPrize.query.filter_by(draw_period_id=period.id).all()
+        if not prizes:
+            return json_response(400, "該期尚未設定任何獎項與獎號，無法執行對獎", None)
+
+        # 計算該期開立日範圍
+        import re
+
+        match = re.match(r"^(\d{4})-(01|03|05|07|09|11)$", period.period_key)
+        if not match:
+            return json_response(400, "期別格式錯誤，無法計算開立日範圍", None)
+        year = int(match.group(1))
+        start_month = int(match.group(2))
+        start_date = date(year, start_month, 1)
+        end_month = start_month + 1
+        if end_month in {1, 3, 5, 7, 8, 10, 12}:
+            last_day = 31
+        elif end_month in {4, 6, 9, 11}:
+            last_day = 30
+        else:
+            last_day = 29 if (year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)) else 28
+        end_date = date(year, end_month, last_day)
+
+        # 找出所有開立日落在該期，且未作廢（prize_status != 'void'）的發票
+        invoices = (
+            Invoice.query.filter(
+                Invoice.issued_on >= start_date,
+                Invoice.issued_on <= end_date,
+                Invoice.prize_status != "void",
+            )
+            .all()
+        )
+
+        checked_count = len(invoices)
+        won_count = 0
+
+        # 將該期的開獎獎項依照獎項規則分類
+        special_prizes = [p for p in prizes if p.tier == "special"]
+        grand_prizes = [p for p in prizes if p.tier == "grand"]
+        first_prizes = [p for p in prizes if p.tier == "first"]
+        # 頭獎衍生獎項設定（依資料庫中的定義）：second(末7), third(末6), fourth(末5), fifth(末4), sixth(末3)
+        other_prizes = [p for p in prizes if p.tier not in {"special", "grand", "first"}]
+
+        for inv in invoices:
+            # 去掉發票號碼前兩碼英文，取後 8 碼數字
+            inv_num = inv.number[2:]
+            won = False
+
+            # 1. 對特別獎（同期 8 碼全中）
+            if any(p.matching_number == inv_num for p in special_prizes):
+                won = True
+
+            # 2. 對特獎（同期 8 碼全中）
+            if not won and any(p.matching_number == inv_num for p in grand_prizes):
+                won = True
+
+            # 3. 對頭獎與其衍生二~六獎
+            if not won and first_prizes:
+                for fp in first_prizes:
+                    fn = fp.matching_number
+                    if inv_num == fn:
+                        won = True
+                        break
+                    elif inv_num[-7:] == fn[-7:] and any(p.tier == "second" for p in prizes):
+                        won = True
+                        break
+                    elif inv_num[-6:] == fn[-6:] and any(p.tier == "third" for p in prizes):
+                        won = True
+                        break
+                    elif inv_num[-5:] == fn[-5:] and any(p.tier == "fourth" for p in prizes):
+                        won = True
+                        break
+                    elif inv_num[-4:] == fn[-4:] and any(p.tier == "fifth" for p in prizes):
+                        won = True
+                        break
+                    elif inv_num[-3:] == fn[-3:] and any(p.tier == "sixth" for p in prizes):
+                        won = True
+                        break
+
+            # 4. 對其他獨立獎項（例如增開六獎 extra_sixth 末 3 碼，或獨立設定之 sixth）
+            if not won and other_prizes:
+                for op in other_prizes:
+                    m_len = len(op.matching_number)
+                    if inv_num[-m_len:] == op.matching_number:
+                        won = True
+                        break
+
+            # 依對獎結果更新發票狀態（已兌領 claimed 保持 claimed；否則依中獎更新為 won 或 lost）
+            if won:
+                won_count += 1
+                if inv.prize_status != "claimed":
+                    inv.prize_status = "won"
+            else:
+                if inv.prize_status != "claimed":
+                    inv.prize_status = "lost"
+
+            inv.updated_at = datetime.now(timezone.utc)
+
+        db.session.commit()
+        return json_response(
+            200,
+            "對獎完成",
+            {
+                "period_id": period.id,
+                "period_key": period.period_key,
+                "checked_count": checked_count,
+                "won_count": won_count,
+            },
+        )
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.post("/invoices/<int:invoice_id>/prize-income")
+def claim_invoice_prize(invoice_id):
+    try:
+        invoice = db.session.get(Invoice, invoice_id)
+        if not invoice:
+            return json_response(404, "找不到指定的發票", None)
+
+        # 狀態檢查：僅 prize_status 為 won 且尚未有入帳時可呼叫
+        if invoice.prize_status != "won":
+            return json_response(
+                400,
+                f"該發票中獎狀態為 {invoice.prize_status}，只有狀態為 won（已中獎）之發票才可領取獎金",
+                None,
+            )
+
+        # 檢查是否已存在對應此 invoice_id 的入帳
+        existing_income = Income.query.filter_by(invoice_id=invoice.id).first()
+        if existing_income:
+            return json_response(400, "此發票已領取過獎金，不可重複領取", None)
+
+        if not request.is_json:
+            return json_response(400, "請使用 JSON 格式傳送請求", None)
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return json_response(400, "請求內容必須為 JSON 物件", None)
+
+        # 必填：category_id 與 account_id
+        raw_cat_id = payload.get("category_id")
+        if raw_cat_id is None:
+            return json_response(400, "缺少必填欄位：category_id（入帳分類）", None)
+        try:
+            category_id = int(raw_cat_id)
+            cat = db.session.get(IncomeCategory, category_id)
+            if not cat:
+                return json_response(400, "指定的入帳分類不存在", None)
+        except (ValueError, TypeError):
+            return json_response(400, "入帳分類 ID 必須為整數", None)
+
+        raw_acc_id = payload.get("account_id")
+        if raw_acc_id is None:
+            return json_response(400, "缺少必填欄位：account_id（入帳帳戶）", None)
+        try:
+            account_id = int(raw_acc_id)
+            acc = db.session.get(Account, account_id)
+            if not acc:
+                return json_response(400, "指定的入帳帳戶不存在", None)
+        except (ValueError, TypeError):
+            return json_response(400, "入帳帳戶 ID 必須為整數", None)
+
+        # 計算對到的獎金金額：從開獎期別與獎號表查找
+        period_key = compute_period_key(invoice.issued_on)
+        period = DrawPeriod.query.filter_by(period_key=period_key).first()
+        if not period:
+            return json_response(400, "找不到該發票開立期別之開獎資料", None)
+
+        prizes = DrawPrize.query.filter_by(draw_period_id=period.id).all()
+        inv_num = invoice.number[2:]
+
+        matched_amount = None
+
+        special_prizes = [p for p in prizes if p.tier == "special"]
+        grand_prizes = [p for p in prizes if p.tier == "grand"]
+        first_prizes = [p for p in prizes if p.tier == "first"]
+        second_prizes = [p for p in prizes if p.tier == "second"]
+        third_prizes = [p for p in prizes if p.tier == "third"]
+        fourth_prizes = [p for p in prizes if p.tier == "fourth"]
+        fifth_prizes = [p for p in prizes if p.tier == "fifth"]
+        sixth_prizes = [p for p in prizes if p.tier == "sixth"]
+        extra_sixth_prizes = [p for p in prizes if p.tier == "extra_sixth"]
+
+        # 優先判定特別獎
+        for sp in special_prizes:
+            if sp.matching_number == inv_num:
+                matched_amount = sp.amount
+                break
+
+        # 次判定特獎
+        if matched_amount is None:
+            for gp in grand_prizes:
+                if gp.matching_number == inv_num:
+                    matched_amount = gp.amount
+                    break
+
+        # 次判定頭獎與二~六獎
+        if matched_amount is None and first_prizes:
+            for fp in first_prizes:
+                fn = fp.matching_number
+                if inv_num == fn:
+                    matched_amount = fp.amount
+                    break
+                elif inv_num[-7:] == fn[-7:] and second_prizes:
+                    matched_amount = second_prizes[0].amount
+                    break
+                elif inv_num[-6:] == fn[-6:] and third_prizes:
+                    matched_amount = third_prizes[0].amount
+                    break
+                elif inv_num[-5:] == fn[-5:] and fourth_prizes:
+                    matched_amount = fourth_prizes[0].amount
+                    break
+                elif inv_num[-4:] == fn[-4:] and fifth_prizes:
+                    matched_amount = fifth_prizes[0].amount
+                    break
+                elif inv_num[-3:] == fn[-3:] and sixth_prizes:
+                    matched_amount = sixth_prizes[0].amount
+                    break
+
+        # 次判定增開六獎
+        if matched_amount is None and extra_sixth_prizes:
+            for esp in extra_sixth_prizes:
+                m_len = len(esp.matching_number)
+                if inv_num[-m_len:] == esp.matching_number:
+                    matched_amount = esp.amount
+                    break
+
+        if matched_amount is None:
+            return json_response(400, "無法比對該發票之獎金金額，請確認開獎期別獎項設定", None)
+
+        # 建立入帳記錄（匯率沿用發票，source 為發票中獎，invoice_id 指向此發票）
+        income = Income(
+            received_on=date.today(),
+            amount=matched_amount,
+            currency=invoice.currency,
+            fx_rate_to_twd=invoice.fx_rate_to_twd,
+            category_id=category_id,
+            account_id=account_id,
+            source=f"統一發票中獎：{invoice.number}",
+            note=None,
+            invoice_id=invoice.id,
+        )
+
+        invoice.prize_status = "claimed"
+        invoice.updated_at = datetime.now(timezone.utc)
+
+        db.session.add(income)
+        db.session.commit()
+
+        return json_response(
+            201,
+            "發票中獎入帳成功",
+            {
+                "invoice": invoice.to_dict(),
+                "income": income.to_dict(),
+            },
+        )
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(
+            400, "發票中獎入帳失敗，資料違反約束條件（例如已重複入帳）", None
+        )
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+# ==========================================
+# 投資標的、交易與持有 (Instruments & Trades)
+# ==========================================
+
+
+def calculate_instrument_holding(instrument_id: int):
+    """依 traded_on ASC, id ASC 重播交易，回傳 (當前持有數量, 平均買進成本)。
+    忽略 voided_at 有值的交易。
+    平均成本只納入 buy 與 drip 的價格和數量。
+    賣出後成本依平均成本等比例減少。
+    stock_dividend 增加股數、不增加成本。
+    split 與 merge 用 ratio 調整股數，總成本不變。
+    capital_reduction：若為純減資/彌補虧損或退資，依 ratio 或股數調整；若無 ratio 且帶 quantity 則依此減少股數。
+    """
+    trades = (
+        Trade.query.filter(
+            Trade.instrument_id == instrument_id, Trade.voided_at.is_(None)
+        )
+        .order_by(Trade.traded_on.asc(), Trade.id.asc())
+        .all()
+    )
+
+    holding_qty = Decimal("0")
+    total_cost = Decimal("0")
+
+    for tr in trades:
+        t_type = tr.trade_type
+        qty = tr.quantity if tr.quantity is not None else Decimal("0")
+        prc = tr.price if tr.price is not None else Decimal("0")
+        ratio = tr.ratio if tr.ratio is not None else Decimal("1")
+
+        if t_type in {"buy", "drip"}:
+            holding_qty += qty
+            total_cost += qty * prc
+        elif t_type == "stock_dividend":
+            holding_qty += qty
+            # 總成本不變
+        elif t_type == "sell":
+            if holding_qty > Decimal("0"):
+                avg_cost = total_cost / holding_qty
+                holding_qty -= qty
+                if holding_qty <= Decimal("0"):
+                    holding_qty = Decimal("0")
+                    total_cost = Decimal("0")
+                else:
+                    total_cost = holding_qty * avg_cost
+            else:
+                holding_qty -= qty
+        elif t_type in {"split", "merge"}:
+            if ratio > Decimal("0"):
+                holding_qty = holding_qty * ratio
+                # 總成本不變
+        elif t_type == "capital_reduction":
+            if tr.ratio is not None and tr.ratio > Decimal("0"):
+                holding_qty = holding_qty * tr.ratio
+            elif tr.quantity is not None:
+                holding_qty -= tr.quantity
+                if holding_qty <= Decimal("0"):
+                    holding_qty = Decimal("0")
+                    total_cost = Decimal("0")
+
+    avg_buy_cost = (
+        (total_cost / holding_qty) if holding_qty > Decimal("0") else Decimal("0")
+    )
+    return holding_qty, avg_buy_cost
+
+
+@api_bp.post("/instruments")
+def create_instrument():
+    if not request.is_json:
+        return json_response(400, "請使用 JSON 格式傳送請求", None)
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return json_response(400, "請求內容必須為 JSON 物件", None)
+
+    # 必填：market
+    raw_market = payload.get("market")
+    allowed_markets = {"tw_stock", "us_stock", "fund", "other"}
+    if not raw_market or str(raw_market).strip() not in allowed_markets:
+        return json_response(
+            400, "市場別不合法，只允許 tw_stock、us_stock、fund、other", None
+        )
+    market = str(raw_market).strip()
+
+    # 必填：symbol
+    raw_symbol = payload.get("symbol")
+    if not raw_symbol or not isinstance(raw_symbol, str) or not raw_symbol.strip():
+        return json_response(400, "缺少必填欄位或欄位為空：symbol（標的代號）", None)
+    symbol = raw_symbol.strip()
+
+    # 必填：name
+    raw_name = payload.get("name")
+    if not raw_name or not isinstance(raw_name, str) or not raw_name.strip():
+        return json_response(400, "缺少必填欄位或欄位為空：name（標的名稱）", None)
+    name = raw_name.strip()
+
+    # 必填：currency（3 碼）
+    raw_currency = payload.get("currency")
+    if (
+        not raw_currency
+        or not isinstance(raw_currency, str)
+        or len(raw_currency.strip()) != 3
+    ):
+        return json_response(400, "幣別代碼必須為 3 碼英文字母", None)
+    currency = raw_currency.strip().upper()
+
+    try:
+        existing = Instrument.query.filter_by(market=market, symbol=symbol).first()
+        if existing:
+            return json_response(400, "同一個市場中的標的代號已存在，不可重複建立", None)
+
+        instrument = Instrument(
+            market=market,
+            symbol=symbol,
+            name=name,
+            currency=currency,
+        )
+        db.session.add(instrument)
+        db.session.commit()
+        return json_response(201, "投資標的建立成功", instrument.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "投資標的資料違反約束條件（例如代號重複）", None)
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.get("/instruments")
+def get_instruments():
+    try:
+        instruments = Instrument.query.order_by(Instrument.id.asc()).all()
+        return json_response(
+            200, "成功取得投資標的清單", [inst.to_dict() for inst in instruments]
+        )
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.get("/instruments/<int:instrument_id>")
+def get_instrument(instrument_id):
+    try:
+        instrument = db.session.get(Instrument, instrument_id)
+        if not instrument:
+            return json_response(404, "找不到指定的投資標的", None)
+        return json_response(200, "成功取得投資標的資料", instrument.to_dict())
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.get("/instruments/<int:instrument_id>/holding")
+def get_instrument_holding(instrument_id):
+    try:
+        instrument = db.session.get(Instrument, instrument_id)
+        if not instrument:
+            return json_response(404, "找不到指定的投資標的", None)
+
+        qty, avg_cost = calculate_instrument_holding(instrument.id)
+
+        data = {
+            "instrument_id": instrument.id,
+            "market": instrument.market,
+            "symbol": instrument.symbol,
+            "name": instrument.name,
+            "quantity": float(qty),
+            "average_buy_cost": float(avg_cost),
+            "currency": instrument.currency,
+        }
+        return json_response(200, "成功取得投資標的持倉資料", data)
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.post("/trades")
+def create_trade():
+    if not request.is_json:
+        return json_response(400, "請使用 JSON 格式傳送請求", None)
+
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return json_response(400, "請求內容必須為 JSON 物件", None)
+
+    # 必填：instrument_id
+    raw_inst_id = payload.get("instrument_id")
+    if raw_inst_id is None:
+        return json_response(400, "缺少必填欄位：instrument_id（投資標的）", None)
+    try:
+        instrument_id = int(raw_inst_id)
+        inst = db.session.get(Instrument, instrument_id)
+        if not inst:
+            return json_response(400, "指派的投資標的不存在", None)
+    except (ValueError, TypeError):
+        return json_response(400, "投資標的 ID 必須為整數", None)
+
+    # 必填：account_id
+    raw_acc_id = payload.get("account_id")
+    if raw_acc_id is None:
+        return json_response(400, "缺少必填欄位：account_id（交割帳戶）", None)
+    try:
+        account_id = int(raw_acc_id)
+        acc = db.session.get(Account, account_id)
+        if not acc:
+            return json_response(400, "指派的交割帳戶不存在", None)
+    except (ValueError, TypeError):
+        return json_response(400, "交割帳戶 ID 必須為整數", None)
+
+    # 必填：trade_type
+    raw_type = payload.get("trade_type")
+    allowed_types = {
+        "buy",
+        "sell",
+        "cash_dividend",
+        "stock_dividend",
+        "drip",
+        "split",
+        "merge",
+        "capital_reduction",
+    }
+    if not raw_type or str(raw_type).strip() not in allowed_types:
+        return json_response(
+            400,
+            "交易種類不合法，只允許 buy、sell、cash_dividend、stock_dividend、drip、split、merge、capital_reduction",
+            None,
+        )
+    trade_type = str(raw_type).strip()
+
+    # 必填：traded_on
+    raw_traded_on = payload.get("traded_on")
+    if not raw_traded_on:
+        return json_response(400, "缺少必填欄位：traded_on（交易日期）", None)
+    try:
+        traded_on = date.fromisoformat(str(raw_traded_on).strip())
+    except (ValueError, TypeError):
+        return json_response(400, "交易日期格式錯誤，請使用 YYYY-MM-DD 格式", None)
+
+    # 必填：currency
+    raw_currency = payload.get("currency")
+    if (
+        not raw_currency
+        or not isinstance(raw_currency, str)
+        or len(raw_currency.strip()) != 3
+    ):
+        return json_response(400, "幣別代碼必須為 3 碼英文字母", None)
+    currency = raw_currency.strip().upper()
+
+    # 必填：fx_rate_to_twd
+    raw_fx = payload.get("fx_rate_to_twd")
+    if raw_fx is None:
+        return json_response(400, "缺少必填欄位：fx_rate_to_twd（台幣匯率）", None)
+    try:
+        fx_rate_to_twd = Decimal(str(raw_fx).strip())
+        if fx_rate_to_twd <= Decimal("0"):
+            return json_response(400, "台幣匯率必須大於 0", None)
+    except (InvalidOperation, ValueError, TypeError):
+        return json_response(400, "台幣匯率格式不正確，必須為數值", None)
+
+    # 解析數值欄位
+    def parse_optional_decimal(key, field_label, non_negative=False):
+        raw = payload.get(key)
+        if raw is None or not str(raw).strip():
+            return None
+        try:
+            val = Decimal(str(raw).strip())
+            if non_negative and val < Decimal("0"):
+                raise ValueError(f"{field_label}不可為負數")
+            return val
+        except (InvalidOperation, ValueError, TypeError):
+            raise ValueError(f"{field_label}格式不正確，必須為數值")
+
+    try:
+        quantity = parse_optional_decimal("quantity", "數量", non_negative=True)
+        price = parse_optional_decimal("price", "單價", non_negative=True)
+        cash_amount = parse_optional_decimal("cash_amount", "現金金額", non_negative=True)
+        ratio = parse_optional_decimal("ratio", "調整比例", non_negative=True)
+        fee = parse_optional_decimal("fee", "手續費", non_negative=True)
+        tax = parse_optional_decimal("tax", "交易稅", non_negative=True)
+    except ValueError as ve:
+        return json_response(400, str(ve), None)
+
+    # 依種類要求欄位
+    if trade_type in {"buy", "sell", "drip"}:
+        if quantity is None or quantity <= Decimal("0"):
+            return json_response(400, f"{trade_type} 交易必填數量（quantity）且必須大於 0", None)
+        if price is None or price < Decimal("0"):
+            return json_response(400, f"{trade_type} 交易必填價格（price）", None)
+    elif trade_type == "stock_dividend":
+        if quantity is None or quantity <= Decimal("0"):
+            return json_response(400, "股票股利必填數量（quantity）且必須大於 0", None)
+    elif trade_type in {"split", "merge"}:
+        if ratio is None or ratio <= Decimal("0"):
+            return json_response(400, f"{trade_type} 交易必填比例（ratio）且必須大於 0", None)
+    elif trade_type == "cash_dividend":
+        if cash_amount is None or cash_amount <= Decimal("0"):
+            return json_response(400, "現金股利必填現金金額（cash_amount）且必須大於 0", None)
+    elif trade_type == "capital_reduction":
+        if (cash_amount is None or cash_amount <= Decimal("0")) and (
+            ratio is None and quantity is None
+        ):
+            return json_response(
+                400, "減資交易需填寫退回現金金額（cash_amount）或減資比例／股數", None
+            )
+
+    # 關鍵防護：sell 與 capital_reduction 若會使持有數量小於 0，回傳 400，不要寫入
+    current_holding, _ = calculate_instrument_holding(inst.id)
+    if trade_type == "sell":
+        if quantity is not None and quantity > current_holding:
+            return json_response(
+                400,
+                f"賣出數量（{quantity}）超過目前持有股數（{current_holding}），拒絕寫入",
+                None,
+            )
+    elif trade_type == "capital_reduction":
+        if quantity is not None and quantity > current_holding:
+            return json_response(
+                400,
+                f"減資銷除股數（{quantity}）超過目前持有股數（{current_holding}），拒絕寫入",
+                None,
+            )
+
+    # 檢查是否需要同步入帳 post_income
+    post_income = payload.get("post_income")
+    should_post_income = False
+    income_category_id = None
+
+    if post_income is True and trade_type in {"cash_dividend", "capital_reduction"} and cash_amount is not None and cash_amount > Decimal("0"):
+        raw_inc_cat = payload.get("income_category_id")
+        if raw_inc_cat is None:
+            return json_response(400, "請求同步入帳時，必填 income_category_id（入帳分類）", None)
+        try:
+            income_category_id = int(raw_inc_cat)
+            cat = db.session.get(IncomeCategory, income_category_id)
+            if not cat:
+                return json_response(400, "指派的入帳分類不存在", None)
+        except (ValueError, TypeError):
+            return json_response(400, "入帳分類 ID 必須為整數", None)
+        should_post_income = True
+
+    try:
+        trade = Trade(
+            instrument_id=instrument_id,
+            account_id=account_id,
+            trade_type=trade_type,
+            traded_on=traded_on,
+            quantity=quantity,
+            price=price,
+            cash_amount=cash_amount,
+            ratio=ratio,
+            fee=fee,
+            tax=tax,
+            currency=currency,
+            fx_rate_to_twd=fx_rate_to_twd,
+        )
+        db.session.add(trade)
+        db.session.flush()  # 取得 trade.id
+
+        if should_post_income:
+            income = Income(
+                received_on=traded_on,
+                amount=cash_amount,
+                currency=currency,
+                fx_rate_to_twd=fx_rate_to_twd,
+                category_id=income_category_id,
+                account_id=account_id,
+                source=f"投資收益：{inst.symbol} {inst.name} ({trade_type})",
+                note=None,
+                trade_id=trade.id,
+            )
+            db.session.add(income)
+
+        db.session.commit()
+        return json_response(201, "投資交易新增成功", trade.to_dict())
+    except IntegrityError:
+        db.session.rollback()
+        return json_response(400, "交易資料違反約束條件", None)
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.get("/trades")
+def get_trades():
+    try:
+        query = Trade.query
+
+        raw_inst_id = request.args.get("instrument_id")
+        if raw_inst_id is not None:
+            try:
+                inst_id = int(raw_inst_id)
+                query = query.filter(Trade.instrument_id == inst_id)
+            except (ValueError, TypeError):
+                return json_response(400, "查詢參數 instrument_id 必須為整數", None)
+
+        raw_acc_id = request.args.get("account_id")
+        if raw_acc_id is not None:
+            try:
+                acc_id = int(raw_acc_id)
+                query = query.filter(Trade.account_id == acc_id)
+            except (ValueError, TypeError):
+                return json_response(400, "查詢參數 account_id 必須為整數", None)
+
+        trades = query.order_by(Trade.traded_on.asc(), Trade.id.asc()).all()
+        return json_response(200, "成功取得投資交易清單", [tr.to_dict() for tr in trades])
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
+@api_bp.post("/trades/<int:trade_id>/void")
+def void_trade(trade_id):
+    try:
+        trade = db.session.get(Trade, trade_id)
+        if not trade:
+            return json_response(404, "找不到指定的投資交易", None)
+
+        if trade.voided_at is not None:
+            return json_response(400, "此交易先前已作廢，不可重複作廢", None)
+
+        # 若這筆交易已有入帳，回 400，不要作廢
+        existing_income = Income.query.filter_by(trade_id=trade.id).first()
+        if existing_income:
+            return json_response(
+                400, "此交易已關聯入帳記錄，請先處理關聯入帳後再作廢", None
+            )
+
+        trade.voided_at = datetime.now(timezone.utc)
+        trade.updated_at = datetime.now(timezone.utc)
+        db.session.commit()
+        return json_response(200, "投資交易作廢成功", trade.to_dict())
+    except Exception:
+        db.session.rollback()
+        return json_response(500, "資料庫暫時連不上", None)
+
+
 
