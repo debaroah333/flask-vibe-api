@@ -38,16 +38,56 @@ def create_app():
     db.init_app(app)
 
     import re
+    from urllib.parse import urlsplit
     from flask import make_response, request
+
+    def normalize_origin(val: str) -> str:
+        if not val:
+            return ""
+        val = val.strip()
+        parsed = urlsplit(val)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}".lower()
+        return val.rstrip("/").lower()
 
     def is_allowed_origin(origin: str) -> bool:
         if not origin:
             return False
-        if re.match(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$", origin):
+
+        norm_origin = normalize_origin(origin)
+
+        # 預設允許本機開發常用網段 (localhost, 127.x.x.x, 0.0.0.0 等)
+        if re.match(r"^https?://(localhost|127\.\d+\.\d+\.\d+|0\.0\.0\.0)(:\d+)?$", norm_origin):
             return True
+
         web_origin = os.getenv("WEB_ORIGIN")
-        if web_origin and origin == web_origin.strip():
-            return True
+        if not web_origin:
+            return False
+
+        # 支援以逗號、分號、換行或空白分隔的多個網域設定
+        allowed_items = [item.strip() for item in re.split(r"[,;\s]+", web_origin) if item.strip()]
+        parsed_origin = urlsplit(norm_origin)
+        origin_host = (parsed_origin.netloc or norm_origin).split(":")[0].lower()
+
+        for item in allowed_items:
+            if item == "*":
+                return True
+
+            norm_item = normalize_origin(item)
+            if norm_origin == norm_item:
+                return True
+
+            # 針對可能只輸入主機名或萬用字元（例如 debaroah333.github.io, *.github.io, github.io）的比對
+            parsed_item = urlsplit(norm_item)
+            item_host = (parsed_item.netloc if "://" in norm_item else norm_item).split(":")[0].lower()
+
+            if item_host == origin_host:
+                return True
+            if item_host in ("github.io", "*.github.io") and origin_host.endswith(".github.io"):
+                return True
+            if item_host.startswith("*.") and origin_host.endswith(item_host[1:]):
+                return True
+
         return False
 
     @app.before_request
